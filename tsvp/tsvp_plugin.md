@@ -1,6 +1,7 @@
 # Transport Stream Verification Payload Version 1
 
-The following describes version 1 of an MPEG2TS packet payload format for validation of TS inputs and PID filters.
+The following describes version 1 of a custom MPEG2TS packet payload format for automated validation of TS inputs and PID filters on the receiver side.
+The format has a magic for identification and a version number for possible later features.
 
 ## Data format
 
@@ -99,8 +100,7 @@ additional wire values.
 ## TSDuck `tsvp` plugin
 
 The processor plugin generates TSVP packets by replacing null packets in the input transport stream. It does not
-increase the packet count or transport bitrate. It has no `--count` option; generation continues for the lifetime of
-the stream.
+increase the packet count or transport bitrate.
 
 | Option | Default | Description |
 |---|---:|---|
@@ -124,8 +124,8 @@ Examples:
 
 ```sh
 tsp -I file input.ts -P tsvp --pid 0x1F00 -O file verified.ts
-tsp -I file input.ts -P tsvp --pid 0x1F00 --pid 0x1F01 --every 250 --fill-pattern cycle -O file verified.ts
-tsp -I file input.ts -P tsvp --pid 0x1F00 --fill-pattern random -O file verified.ts
+tsp -I file input.ts -P tsvp --pid 0x1F00 --pid 0x1F01 --every 250 --fill-pattern cycle -O file verify_me.ts
+tsp -I file input.ts -P tsvp --pid 0x1F00 --fill-pattern random -O file verify_me.ts
 ```
 
 ## Receiver-side C example
