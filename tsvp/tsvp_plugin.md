@@ -128,185 +128,30 @@ tsp -I file input.ts -P tsvp --pid 0x1F00 --pid 0x1F01 --every 250 --fill-patter
 tsp -I file input.ts -P tsvp --pid 0x1F00 --fill-pattern random -O file verify_me.ts
 ```
 
-## Receiver-side C example
+## Receiver-side C++ validator
 
-The following C99 example validates one 188-byte TS packet and returns the decoded fields. It parses bytes explicitly,
-so it does not depend on host endianness, alignment, or compiler-specific packed-structure behavior. The caller should
-only update session and sequence tracking state after this function succeeds.
+[`TsvpValidator.h`](TsvpValidator.h) and [`TsvpValidator.cpp`](TsvpValidator.cpp) contain a standalone C++17 class
+that validates 188-byte transport packets and exposes decoded fields in `TsvpView`. It parses wire bytes explicitly,
+without relying on host endianness, alignment, or packed structures. It checks TS framing and PID, TSVP magic and
+version, payload CRC, duplicated TS header, adaptation CRC, fill bytes, session changes, sequence order, and
+non-decreasing transmit timestamps. The caller owns a `TsvpState` and passes it to each validation call. Select
+`GlobalSequencePolicy::Consecutive` when every generated TSVP packet is present; use `Increasing` when filtering can
+create gaps in `global_seq`. Per-PID sequence numbers are always checked for increments of one.
 
-```c
-#include <stddef.h>
-#include <stdint.h>
-#include <string.h>
+`TsvpView::fill_pattern` points into the input packet buffer. Use the view before reusing or modifying that buffer.
 
-#define TS_PACKET_SIZE 188u
-#define TSVP_HEADER_SIZE 44u
-#define TSVP_CRC_OFFSET 40u
+[`main.cpp`](main.cpp) is a small command-line scanner for a binary TS file and a target PID. Build and run it from
+this directory:
 
-struct tsvp_view {
-  uint16_t pid;
-  uint8_t session_id;
-  uint64_t global_seq;
-  uint64_t pid_seq;
-  uint64_t tx_timestamp_ns;
-  uint8_t fill_pattern_type;
-  const uint8_t *fill_pattern;
-  size_t fill_size;
-};
-
-static uint16_t read_be16(const uint8_t *bytes)
-{
-  return (uint16_t)(((uint16_t)bytes[0] << 8) | bytes[1]);
-}
-
-static uint32_t read_be32(const uint8_t *bytes)
-{
-  return ((uint32_t)bytes[0] << 24) |
-       ((uint32_t)bytes[1] << 16) |
-       ((uint32_t)bytes[2] << 8) |
-       (uint32_t)bytes[3];
-}
-
-static uint64_t read_be64(const uint8_t *bytes)
-{
-  return ((uint64_t)read_be32(bytes) << 32) | read_be32(bytes + 4);
-}
-
-static uint32_t mpeg2_crc32(const uint8_t *bytes, size_t size)
-{
-  uint32_t crc = 0xFFFFFFFFu;
-  size_t index;
-  unsigned bit;
-
-  for (index = 0; index < size; ++index) {
-    crc ^= (uint32_t)bytes[index] << 24;
-    for (bit = 0; bit < 8; ++bit) {
-      crc = (crc & 0x80000000u) != 0
-        ? (crc << 1) ^ 0x04C11DB7u
-        : crc << 1;
-    }
-  }
-  return crc;
-}
-
-static int fill_matches(const uint8_t *fill, size_t size, uint8_t type, uint64_t global_seq)
-{
-  size_t index;
-
-  if (type == 0) {
-    uint8_t state = (uint8_t)(global_seq & 0x7Fu);
-    if (state == 0) {
-      state = 0x7Fu;
-    }
-    for (index = 0; index < size; ++index) {
-      uint8_t expected = 0;
-      unsigned bit;
-      for (bit = 0; bit < 8; ++bit) {
-        const uint8_t output_bit = (uint8_t)((state >> 6) & 1u);
-        const uint8_t feedback = (uint8_t)(((state >> 6) ^ (state >> 5)) & 1u);
-        expected = (uint8_t)((expected << 1) | output_bit);
-        state = (uint8_t)(((state << 1) | feedback) & 0x7Fu);
-      }
-      if (fill[index] != expected) {
-        return 0;
-      }
-    }
-    return 1;
-  }
-
-  if (type > 4) {
-    return 0;
-  }
-  {
-    static const uint8_t values[5] = {0x00, 0x00, 0xFF, 0x55, 0xAA};
-    const uint8_t expected = values[type];
-    for (index = 0; index < size; ++index) {
-      if (fill[index] != expected) {
-        return 0;
-      }
-    }
-  }
-  return 1;
-}
-
-/* Returns 1 for a valid TSVP packet, 0 otherwise. */
-static int tsvp_validate_packet(const uint8_t packet[TS_PACKET_SIZE],
-                uint16_t expected_pid,
-                struct tsvp_view *view)
-{
-  unsigned adaptation_control;
-  size_t payload_offset;
-  uint32_t adaptation_crc = 0;
-  uint16_t pid;
-  const uint8_t *payload;
-  size_t payload_size;
-  size_t fill_size;
-  uint64_t global_seq;
-  uint8_t fill_type;
-
-  if (packet == NULL || view == NULL || packet[0] != 0x47u) {
-    return 0;
-  }
-  pid = (uint16_t)(((uint16_t)(packet[1] & 0x1Fu) << 8) | packet[2]);
-  if (pid != expected_pid) {
-    return 0;
-  }
-
-  adaptation_control = (packet[3] >> 4) & 0x03u;
-  if (adaptation_control == 1u) {
-    payload_offset = 4;
-  }
-  else if (adaptation_control == 3u) {
-    const size_t adaptation_length = packet[4];
-    if (adaptation_length > 183u) {
-      return 0;
-    }
-    payload_offset = 5u + adaptation_length;
-    if (payload_offset >= TS_PACKET_SIZE) {
-      return 0;
-    }
-    adaptation_crc = mpeg2_crc32(packet + 4, adaptation_length + 1u);
-  }
-  else {
-    /* Reserved or adaptation-only packets do not carry a TSVP payload. */
-    return 0;
-  }
-
-  payload_size = TS_PACKET_SIZE - payload_offset;
-  if (payload_size < TSVP_HEADER_SIZE) {
-    return 0;
-  }
-  payload = packet + payload_offset;
-  if (memcmp(payload, "TSVP", 4) != 0 || read_be16(payload + 4) != 1u) {
-    return 0;
-  }
-  if (read_be32(payload + TSVP_CRC_OFFSET) != mpeg2_crc32(payload, TSVP_CRC_OFFSET)) {
-    return 0;
-  }
-  if (memcmp(payload + 7, packet, 4) != 0 || read_be32(payload + 35) != adaptation_crc) {
-    return 0;
-  }
-
-  fill_size = payload_size - TSVP_HEADER_SIZE;
-  global_seq = read_be64(payload + 11);
-  fill_type = payload[39];
-  if (!fill_matches(payload + TSVP_HEADER_SIZE, fill_size, fill_type, global_seq)) {
-    return 0;
-  }
-
-  view->pid = pid;
-  view->session_id = payload[6];
-  view->global_seq = global_seq;
-  view->pid_seq = read_be64(payload + 19);
-  view->tx_timestamp_ns = read_be64(payload + 27);
-  view->fill_pattern_type = fill_type;
-  view->fill_pattern = payload + TSVP_HEADER_SIZE;
-  view->fill_size = fill_size;
-  return 1;
-}
+```sh
+g++ -std=c++17 -Wall -Wextra -pedantic TsvpValidator.cpp main.cpp -o tsvp-validator
+./tsvp-validator verified.ts 0x1F00
 ```
 
-After packet validation, a receiver can update its state safely. A changed `session_id` resets the sequence baseline.
-On an unfiltered stream, `global_seq` should increase by exactly one; after PID filtering, gaps are expected, but it
-should remain strictly increasing in receive order. For each PID, `pid_seq` should increase by exactly one for every
-observed TSVP packet of that PID. A receiver that starts mid-stream should use the first valid packet as its baseline.
+The scanner reports each valid TSVP packet and a final matched/valid/invalid count. It exits unsuccessfully if the
+file contains no packets on the requested PID, any matching packet fails validation, or the file ends with a partial
+188-byte packet.
+
+A changed `session_id` resets the state baselines after the packet passes its integrity checks. A newly constructed
+`TsvpState` uses the first valid packet as its baseline. Timestamp validation checks sender-time ordering only; timing
+jitter or buffering measurements additionally require recording local monotonic arrival times in the receiver.
